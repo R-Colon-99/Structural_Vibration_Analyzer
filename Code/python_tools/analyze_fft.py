@@ -122,6 +122,7 @@ num_samples = len(t)
 
 print(f"\nData mode: {data_mode}")
 print(f"Estimated sampling rate: {fs:.2f} Hz")
+print(f"Nyquist frequency: {fs/2:.2f} Hz")
 print(f"Duration: {duration:.3f} s")
 print(f"Samples: {num_samples}")
 
@@ -131,7 +132,12 @@ print(f"Samples: {num_samples}")
 
 def centered_signal(column_name):
     signal_raw = df[column_name].to_numpy()
-    return signal_raw - np.mean(signal_raw)
+    signal_centered = signal_raw - np.mean(signal_raw)
+
+    # Optional simple high-pass behavior
+    signal_centered[np.abs(signal_centered) < 0.002] = 0
+
+    return signal_centered
 
 
 def compute_fft(signal_centered):
@@ -192,7 +198,7 @@ def analyze_column(column_name):
     plt.title(f"FFT Frequency Spectrum - {column_name}")
     plt.grid(True)
     plt.xlim(0, fs / 2)
-    plt.xticks(np.arange(0, (fs / 2) + 10, 10))
+    plt.xticks(np.arange(0, (fs / 2) + 25, 25))
 
     fft_plot_path = run_folder / f"fft_plot_{column_name}.png"
     plt.savefig(fft_plot_path, dpi=300, bbox_inches="tight")
@@ -328,7 +334,7 @@ if data_mode == "three_sensor":
         plt.grid(True)
         plt.legend()
         plt.xlim(0, fs / 2)
-        plt.xticks(np.arange(0, (fs / 2) + 10, 10))
+        plt.xticks(np.arange(0, (fs / 2) + 25, 25))
 
         axis_letter = axis.split("_")[0][-1]
         plot_path = run_folder / f"fft_overlap_{axis_letter}_axis_all_sensors.png"
@@ -353,7 +359,7 @@ if data_mode == "three_sensor":
         plt.grid(True)
         plt.legend()
         plt.xlim(0, fs / 2)
-        plt.xticks(np.arange(0, (fs / 2) + 10, 10))
+        plt.xticks(np.arange(0, (fs / 2) + 25, 25))
 
         plot_path = run_folder / f"fft_plot_all_axes_{sensor}.png"
         plt.savefig(plot_path, dpi=300, bbox_inches="tight")
@@ -374,7 +380,7 @@ else:
     plt.grid(True)
     plt.legend()
     plt.xlim(0, fs / 2)
-    plt.xticks(np.arange(0, (fs / 2) + 10, 10))
+    plt.xticks(np.arange(0, (fs / 2) + 25, 25))
 
     plot_path = run_folder / "fft_plot_all_axes.png"
     plt.savefig(plot_path, dpi=300, bbox_inches="tight")

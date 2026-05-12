@@ -20,7 +20,8 @@
 #define SCL_PIN 22
 
 const uint32_t SERIAL_BAUD = 921600;
-const float SAMPLE_RATE_HZ = 500.0;
+
+const float SAMPLE_RATE_HZ = 800.0;
 const uint32_t SAMPLE_PERIOD_US = (uint32_t)(1000000.0 / SAMPLE_RATE_HZ);
 
 const int NUM_SENSORS = 3;
@@ -55,6 +56,7 @@ struct SensorOffset {
   float gz = 0;
 };
 
+uint32_t streamStartUs = 0;
 SensorOffset offsets[NUM_SENSORS];
 uint32_t sampleIndex = 0;
 
@@ -111,10 +113,10 @@ void setupMPUOnSelectedChannel() {
   writeMPU(0x6B, 0x00); // wake up
   delay(100);
 
-  writeMPU(0x1A, 0x03); // DLPF config, approx. 44 Hz accel bandwidth
+  writeMPU(0x1A, 0x01); // DLPF config, approx. 44 Hz accel bandwidth
   writeMPU(0x1B, 0x00); // gyro ±250 deg/s
   writeMPU(0x1C, 0x00); // accel ±2g
-  writeMPU(0x19, 0x01); // sample rate divider
+  writeMPU(0x19, 0x00); // sample rate divider
 }
 
 int16_t clampToInt16(float value) {
@@ -207,7 +209,7 @@ void sendBinaryFrame() {
   appendU8(frame, idx, SYNC1);
   appendU8(frame, idx, PACKET_TYPE_DATA);
   appendU8(frame, idx, PAYLOAD_SIZE);
-  appendU32(frame, idx, micros());
+  appendU32(frame, idx, micros() - streamStartUs);
   appendU32(frame, idx, sampleIndex++);
 
   for (int sensor = 0; sensor < NUM_SENSORS; sensor++) {
@@ -242,7 +244,7 @@ void setup() {
   delay(1000);
 
   Wire.begin(SDA_PIN, SCL_PIN);
-  Wire.setClock(400000);
+  Wire.setClock(800000);
 
   Serial.println("# ESP32 3x MPU6050 PCA9548A binary logger");
   Serial.print("# Baud: ");
@@ -268,6 +270,9 @@ void setup() {
   }
 
   calibrateSensors();
+
+  sampleIndex = 0;
+  streamStartUs = micros();
 
   Serial.println("# Binary stream starting now.");
   Serial.println("START_BINARY");
