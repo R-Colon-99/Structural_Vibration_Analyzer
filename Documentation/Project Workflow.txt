@@ -1,0 +1,27 @@
+Project Workflow
+
+conda activate Mech-Engi-env
+mkdir "F:"				// Create new file location. If location already exists, can skip this step
+cd /d "F:"				// go to file location
+mkdir "Project_Name"			// Create project folder
+cd "Project_Name"			// open project folder
+mkdir data				// make data folder
+mkdir exports				// make exported data folder
+mkdir scripts				// make folder for script versions
+code .					// open VS code to edit scripts
+python scripts\"script_name.py"		// run the script
+
+
+
+Stuctural_Vibration_analyzer:
+
+conda activate Mech-Engi-env
+cd /d F:\RLenovo99\Documents\Projects\Structural_Vibration_Analyzer\Code\python_tools
+python logger_esp32.py
+python analyze_fft.py
+
+PC_App:
+
+conda activate Mech-Engi-env
+cd /d F:\RLenovo99\Documents\Projects\Structural_Vibration_Analyzer\Code\PC_App
+python app.py
