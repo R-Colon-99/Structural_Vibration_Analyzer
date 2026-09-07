@@ -1,4 +1,4 @@
-# V6 - App-ready FFT/FRF analyzer with fixed 0-240 Hz plot range
+# V5 - App-ready FFT/FRF analyzer with automatic sensor detection
 # Structural Vibration Analyzer
 
 import argparse
@@ -41,11 +41,6 @@ DEFAULT_REFERENCE_SENSOR = "auto"
 
 NUM_TOP_PEAKS = 10
 PEAK_MIN_SPACING_HZ = 2.0
-
-# Fixed display range for FFT/FRF/coherence frequency-domain plots.
-# Calculations still use the full available spectrum internally.
-PLOT_FREQUENCY_MIN_HZ = 0.0
-PLOT_FREQUENCY_MAX_HZ = 240.0
 
 FREQUENCY_BANDS = [
     (0, 10),
@@ -217,12 +212,12 @@ print(f"\nAnalyzing:\n{CSV_FILE}", flush=True)
 # ============================================================
 
 raw_stem = CSV_FILE.stem
-run_folder = PROCESSED_DIR / f"{raw_stem}_processed_V6"
+run_folder = PROCESSED_DIR / f"{raw_stem}_processed_V5"
 
 if run_folder.exists():
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     run_folder = (
-        PROCESSED_DIR / f"{raw_stem}_processed_V6_{timestamp}"
+        PROCESSED_DIR / f"{raw_stem}_processed_V5_{timestamp}"
     )
 
 run_folder.mkdir(parents=True, exist_ok=True)
@@ -434,43 +429,11 @@ sampling_stats = {
     ),
 }
 
-# ============================================================
-# FIRMWARE-REPORTED ACQUISITION HEALTH (V7 protocol, if present)
-# ============================================================
-# These are cumulative counters transmitted by the firmware itself (see
-# main.cpp), distinct from the sampling-quality stats above, which are
-# derived purely from timestamps on the PC side. Older CSVs recorded
-# before this protocol version simply won't have these columns, so this
-# section is entirely optional/guarded.
-ACQUISITION_HEALTH_COLUMNS = [
-    "missed_deadlines_total",
-    "i2c_error_total",
-    "i2c_nack_total",
-    "i2c_timeout_total",
-]
-
-acquisition_health = {}
-for column in ACQUISITION_HEALTH_COLUMNS:
-    if column in df.columns:
-        # These are cumulative counters; the final row holds the run total.
-        acquisition_health[column] = int(df[column].iloc[-1])
-
-has_acquisition_health = len(acquisition_health) > 0
-
 print(f"\nData mode: {data_mode}", flush=True)
 print(f"Sensors analyzed: {', '.join(SENSOR_NAMES)}", flush=True)
 print(f"Reference sensor: {REFERENCE_SENSOR}", flush=True)
 print(f"Estimated sampling rate: {fs:.2f} Hz", flush=True)
 print(f"Nyquist frequency: {nyquist:.2f} Hz", flush=True)
-
-if nyquist < PLOT_FREQUENCY_MAX_HZ:
-    print(
-        f"WARNING: Nyquist frequency ({nyquist:.2f} Hz) is below "
-        f"the requested plot maximum ({PLOT_FREQUENCY_MAX_HZ:.2f} Hz). "
-        "The graph will still show 0-240 Hz, but frequencies above Nyquist "
-        "contain no valid FFT data.",
-        flush=True,
-    )
 print(f"Duration: {duration:.3f} s", flush=True)
 print(f"Original samples: {num_samples_original}", flush=True)
 print(f"Median dt: {median_dt:.8f} s", flush=True)
@@ -496,17 +459,6 @@ print(
     f"{'YES' if needs_resampling else 'NO'}",
     flush=True,
 )
-
-if has_acquisition_health:
-    print("\nAcquisition health (firmware-reported, cumulative):", flush=True)
-    for column, value in acquisition_health.items():
-        print(f"  {column}: {value}", flush=True)
-
-    acquisition_health_df = pd.DataFrame([acquisition_health])
-    acquisition_health_csv_path = (
-        run_folder / "acquisition_health_summary.csv"
-    )
-    acquisition_health_df.to_csv(acquisition_health_csv_path, index=False)
 
 
 # ============================================================
@@ -772,7 +724,7 @@ def analyze_column(column_name):
         f"{column_name}"
     )
     plt.grid(True)
-    plt.xlim(PLOT_FREQUENCY_MIN_HZ, PLOT_FREQUENCY_MAX_HZ)
+    plt.xlim(0, nyquist)
 
     fft_plot_path = (
         run_folder / f"fft_plot_{column_name}.png"
@@ -1183,7 +1135,7 @@ if (
         )
         plt.grid(True)
         plt.legend()
-        plt.xlim(PLOT_FREQUENCY_MIN_HZ, PLOT_FREQUENCY_MAX_HZ)
+        plt.xlim(0, nyquist)
 
         axis_letter = axis.split("_")[0][-1]
 
@@ -1219,7 +1171,7 @@ if (
         plt.grid(True)
         plt.legend()
         plt.ylim(0, 1.05)
-        plt.xlim(PLOT_FREQUENCY_MIN_HZ, PLOT_FREQUENCY_MAX_HZ)
+        plt.xlim(0, nyquist)
 
         coherence_plot_path = (
             run_folder
@@ -1332,7 +1284,7 @@ if data_mode != "single_sensor_legacy":
             )
             plt.grid(True)
             plt.legend()
-            plt.xlim(PLOT_FREQUENCY_MIN_HZ, PLOT_FREQUENCY_MAX_HZ)
+            plt.xlim(0, nyquist)
 
             axis_letter = axis.split("_")[0][-1]
 
@@ -1364,7 +1316,7 @@ if data_mode != "single_sensor_legacy":
         )
         plt.grid(True)
         plt.legend()
-        plt.xlim(PLOT_FREQUENCY_MIN_HZ, PLOT_FREQUENCY_MAX_HZ)
+        plt.xlim(0, nyquist)
 
         plot_path = (
             run_folder / f"fft_plot_all_axes_{sensor}.png"
@@ -1388,7 +1340,7 @@ else:
     plt.title("Amplitude-Corrected FFT - All Axes")
     plt.grid(True)
     plt.legend()
-    plt.xlim(PLOT_FREQUENCY_MIN_HZ, PLOT_FREQUENCY_MAX_HZ)
+    plt.xlim(0, nyquist)
 
     plot_path = (
         run_folder / "fft_plot_all_axes.png"
@@ -1400,11 +1352,11 @@ else:
 # SAVE SUMMARY FILE
 # ============================================================
 
-summary_txt_path = run_folder / "summary_V6.txt"
+summary_txt_path = run_folder / "summary_V5.txt"
 
 with open(summary_txt_path, "w") as f:
     f.write(
-        "STRUCTURAL VIBRATION ANALYSIS SUMMARY - V6\n"
+        "STRUCTURAL VIBRATION ANALYSIS SUMMARY - V5\n"
     )
     f.write(
         "=========================================\n\n"
@@ -1467,11 +1419,6 @@ with open(summary_txt_path, "w") as f:
         f"Nyquist frequency: {nyquist:.2f} Hz\n"
     )
     f.write(
-        f"Frequency-domain plot range: "
-        f"{PLOT_FREQUENCY_MIN_HZ:.0f}-"
-        f"{PLOT_FREQUENCY_MAX_HZ:.0f} Hz\n"
-    )
-    f.write(
         f"Estimated dropped samples: "
         f"{sampling_stats['dropped_samples_estimated']}\n"
     )
@@ -1479,18 +1426,6 @@ with open(summary_txt_path, "w") as f:
         f"Repeated or reversed sample indices: "
         f"{sampling_stats['repeated_or_reversed_indices']}\n\n"
     )
-
-    if has_acquisition_health:
-        f.write("Acquisition Health (firmware-reported, cumulative):\n")
-        f.write("---------------------------------------------------\n")
-        f.write(
-            "These counters come directly from the ESP32 firmware, not "
-            "from PC-side timestamp analysis - see main.cpp's I2C error "
-            "classification for what each one means.\n"
-        )
-        for column, value in acquisition_health.items():
-            f.write(f"  {column}: {value}\n")
-        f.write("\n")
 
     f.write("Sensor-Axis Results:\n")
     f.write("--------------------\n\n")
@@ -1570,8 +1505,6 @@ with open(summary_txt_path, "w") as f:
     f.write("------------\n")
     f.write("raw_data_copy.csv\n")
     f.write("sampling_quality_summary.csv\n")
-    if has_acquisition_health:
-        f.write("acquisition_health_summary.csv\n")
     f.write("sampling_jitter_dt_plot.png\n")
     f.write("time_domain_centered_all_sensor_axes.csv\n")
     f.write("time_domain_centered_all_axes.csv\n")

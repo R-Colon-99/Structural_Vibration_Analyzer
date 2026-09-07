@@ -1,6 +1,17 @@
-# V7 - App-ready auto-detect binary logger matching main.cpp V7
-# (dual FAST_ACCEL / FULL_DIAGNOSTIC modes, I2C health counters)
+# VALIDATION LOGGER - for main_validation.cpp only
 # Structural Vibration Analyzer
+#
+# This logger decodes the validation firmware's protocol: accelerometer-
+# only data, per-cycle timing diagnostics, and cumulative I2C error
+# counters. It does NOT perform FFT analysis - see analyze_validation.py
+# for that. It is intentionally separate from the production
+# logger_esp32.py, which is untouched and still used for the normal
+# accel+gyro+temp firmware.
+#
+# The logger adapts to whatever sensor count and instrumentation setting
+# the CONFIG frame reports at runtime. It does not assume exactly 3
+# sensors, and does not assume I2C timing instrumentation is on or off -
+# both are read from the firmware's own CONFIG frame.
 
 import argparse
 import csv
@@ -19,31 +30,23 @@ import serial
 DEFAULT_PORT = "COM3"
 DEFAULT_BAUD = 921600
 DEFAULT_DATA_DIR = Path(
-    r"F:\RLenovo99\Documents\Projects\Structural_Vibration_Analyzer\Data\raw"
+    r"F:\RLenovo99\Documents\Projects\Structural_Vibration_Analyzer\Data\validation"
 )
 
-ACCEL_SCALE = 4096.0  # +/-8 g
-GYRO_SCALE = 131.0    # +/-250 deg/s (FULL_DIAGNOSTIC mode only)
+ACCEL_SCALE = 4096.0  # +/-8 g, matches main_validation.cpp's ACCEL_CONFIG
 
 SYNC = b"\xAA\x55"
 
 PACKET_TYPE_DATA = 0x01
 PACKET_TYPE_CONFIG = 0x02
 
-ACQ_MODE_FAST_ACCEL = 0
-ACQ_MODE_FULL_DIAGNOSTIC = 1
+BASE_DATA_PAYLOAD_SIZE = 32  # t_us, sample_index, cycle_duration_us,
+                              # lateness_us, missed_deadlines_total,
+                              # i2c_error_total, i2c_nack_total,
+                              # i2c_timeout_total (4 bytes each)
+BYTES_PER_SENSOR_ACCEL = 6           # ax, ay, az (int16 each)
+BYTES_PER_SENSOR_INSTRUMENTATION = 4  # pca_select_us, mpu_read_us (uint16 each)
 
-BYTES_PER_SENSOR_FAST_ACCEL = 6          # ax, ay, az (int16 each)
-BYTES_PER_SENSOR_FULL_DIAGNOSTIC = 12    # + gx, gy, gz (int16 each)
-
-# t_us, sample_index, missed_deadlines_total, i2c_error_total,
-# i2c_nack_total, i2c_timeout_total (4 bytes each)
-BASE_DATA_PAYLOAD_SIZE = 24
-
-# PCA channel 0 -> s1, channel 1 -> s2, channel 2 -> s3.
-# Keeping the logical name tied to the physical PCA channel prevents
-# sensor identities from shifting when a sensor is disconnected. Not
-# tied to any fixed sensor count - however many are detected are named.
 CHANNEL_TO_SENSOR_NAME = {
     0: "s1",
     1: "s2",
@@ -58,62 +61,37 @@ CHANNEL_TO_SENSOR_NAME = {
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "ESP32 binary logger for the Structural Vibration Analyzer "
-            "(V7 protocol: FAST_ACCEL/FULL_DIAGNOSTIC modes, I2C health "
-            "counters). Sensor count, active PCA channels, and "
-            "acquisition mode are all detected automatically from the "
-            "firmware's CONFIG frame."
+            "Validation logger for main_validation.cpp (accel-only "
+            "acquisition characterization). Sensor count and I2C "
+            "instrumentation setting are both detected automatically from "
+            "the firmware's CONFIG frame."
         )
     )
 
-    parser.add_argument(
-        "--port",
-        default=DEFAULT_PORT,
-        help=f"Serial port to use. Default: {DEFAULT_PORT}",
-    )
-
-    parser.add_argument(
-        "--baud",
-        type=int,
-        default=DEFAULT_BAUD,
-        help=f"Serial baud rate. Default: {DEFAULT_BAUD}",
-    )
-
-    parser.add_argument(
-        "--output",
-        default=None,
-        help="Output CSV file path. If omitted, a timestamped file is created.",
-    )
-
-    parser.add_argument(
-        "--data-dir",
-        default=str(DEFAULT_DATA_DIR),
-        help="Folder used for timestamped output files when --output is omitted.",
-    )
-
-    parser.add_argument(
-        "--num-sensors",
-        type=int,
-        choices=[1, 2, 3],
-        default=None,
-        help=(
-            "Expected sensor count supplied by the PC app. "
-            "The ESP32 still auto-detects the actual sensors; this value is "
-            "used only to verify that the detected count matches the app selection."
-        ),
-    )
-
+    parser.add_argument("--port", default=DEFAULT_PORT)
+    parser.add_argument("--baud", type=int, default=DEFAULT_BAUD)
+    parser.add_argument("--output", default=None, help="Output CSV path.")
+    parser.add_argument("--data-dir", default=str(DEFAULT_DATA_DIR))
     parser.add_argument(
         "--duration",
         type=float,
         default=None,
-        help="Optional recording duration in seconds. If omitted, records until stopped.",
+        help="Optional recording duration in seconds.",
     )
-
+    parser.add_argument(
+        "--label",
+        default=None,
+        help=(
+            "Optional short label describing this run's condition, e.g. "
+            "'static', 'excited_50hz', 'oversample_stress'. Stored in the "
+            "metadata sidecar so Tests 1-3's comparison runs stay "
+            "distinguishable later."
+        ),
+    )
     parser.add_argument(
         "--prompt",
         action="store_true",
-        help="Ask for ENTER before recording. Useful when running manually.",
+        help="Ask for ENTER before recording.",
     )
 
     return parser.parse_args()
@@ -132,26 +110,25 @@ if args.output:
     output_file.parent.mkdir(parents=True, exist_ok=True)
 else:
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    output_file = DATA_DIR / f"esp32_vibration_{timestamp}.csv"
+    label_part = f"_{args.label}" if args.label else ""
+    output_file = DATA_DIR / f"validation{label_part}_{timestamp}.csv"
 
 metadata_file = output_file.with_suffix(".meta.json")
 
 
 # ============================================================
-# HELPER FUNCTIONS
+# HELPER FUNCTIONS (framing logic mirrors logger_esp32.py)
 # ============================================================
 
 def calculate_checksum(frame_without_checksum: bytes) -> int:
     checksum = 0
-
     for byte in frame_without_checksum:
         checksum ^= byte
-
     return checksum
 
 
 def read_until_binary_start(ser: serial.Serial) -> None:
-    print("\nWaiting for ESP32 startup/calibration messages...\n", flush=True)
+    print("\nWaiting for ESP32 startup messages...\n", flush=True)
 
     while True:
         line = ser.readline()
@@ -184,13 +161,6 @@ def read_exactly(ser: serial.Serial, number_of_bytes: int) -> bytes:
 
 
 def read_frame(ser: serial.Serial):
-    """
-    Search for the AA 55 sync bytes, then read a variable-length frame.
-
-    Returns:
-        (packet_type, payload) when a valid frame is received.
-        None when a frame is malformed or fails checksum.
-    """
     previous = b""
 
     while True:
@@ -222,24 +192,34 @@ def read_frame(ser: serial.Serial):
 
 def decode_config_payload(payload: bytes):
     """
-    CONFIG payload layout (see main.cpp V7 header comment):
-        firmware_version    [u8]
-        dlpf_cfg            [u8]
-        smplrt_div          [u8]
-        acquisition_mode    [u8]
-        target_poll_rate_hz [u32]
-        sensor_count        [u8]
-        active_channels     [u8 x sensor_count]
+    CONFIG payload layout (see main_validation.cpp header comment):
+        protocol_version        [u8]
+        build_id                [u32]
+        build_tag               [8 bytes ASCII]
+        dlpf_cfg                [u8]
+        smplrt_div              [u8]
+        acquisition_mode        [u8]
+        instrumentation_enabled [u8]
+        target_poll_rate_hz     [u32]
+        sensor_count            [u8]
+        active_channels         [u8 x sensor_count]
     """
-    fixed_size = 1 + 1 + 1 + 1 + 4 + 1
+    fixed_size = 1 + 4 + 8 + 1 + 1 + 1 + 1 + 4 + 1
 
     if len(payload) < fixed_size:
         raise ValueError("Configuration packet is too short.")
 
     offset = 0
 
-    firmware_version = payload[offset]
+    protocol_version = payload[offset]
     offset += 1
+
+    (build_id,) = struct.unpack_from("<I", payload, offset)
+    offset += 4
+
+    build_tag_bytes = payload[offset : offset + 8]
+    build_tag = build_tag_bytes.split(b"\x00", 1)[0].decode("ascii", errors="replace")
+    offset += 8
 
     dlpf_cfg = payload[offset]
     offset += 1
@@ -248,6 +228,9 @@ def decode_config_payload(payload: bytes):
     offset += 1
 
     acquisition_mode = payload[offset]
+    offset += 1
+
+    instrumentation_enabled = bool(payload[offset])
     offset += 1
 
     (target_poll_rate_hz,) = struct.unpack_from("<I", payload, offset)
@@ -278,15 +261,13 @@ def decode_config_payload(payload: bytes):
     ]
 
     config = {
-        "firmware_version": firmware_version,
+        "protocol_version": protocol_version,
+        "build_id": build_id,
+        "build_tag": build_tag,
         "dlpf_cfg": dlpf_cfg,
         "smplrt_div": smplrt_div,
         "acquisition_mode": acquisition_mode,
-        "acquisition_mode_name": (
-            "FULL_DIAGNOSTIC"
-            if acquisition_mode == ACQ_MODE_FULL_DIAGNOSTIC
-            else "FAST_ACCEL"
-        ),
+        "instrumentation_enabled": instrumentation_enabled,
         "target_poll_rate_hz": target_poll_rate_hz,
         "sensor_count": sensor_count,
         "active_channels": active_channels,
@@ -297,7 +278,7 @@ def decode_config_payload(payload: bytes):
 
 
 def wait_for_configuration(ser: serial.Serial):
-    print("Waiting for binary sensor configuration packet...", flush=True)
+    print("Waiting for binary configuration packet...", flush=True)
 
     bad_frames = 0
 
@@ -315,10 +296,20 @@ def wait_for_configuration(ser: serial.Serial):
 
         config = decode_config_payload(payload)
 
-        print(f"Firmware version: {config['firmware_version']}", flush=True)
+        print(f"Protocol version: {config['protocol_version']}", flush=True)
+        print(
+            f"Firmware build: {config['build_tag']} "
+            f"(id {config['build_id']})",
+            flush=True,
+        )
         print(
             f"DLPF_CFG={config['dlpf_cfg']}  SMPLRT_DIV={config['smplrt_div']}  "
-            f"acquisition_mode={config['acquisition_mode_name']}",
+            f"acquisition_mode={config['acquisition_mode']}",
+            flush=True,
+        )
+        print(
+            f"I2C timing instrumentation: "
+            f"{'ENABLED' if config['instrumentation_enabled'] else 'disabled'}",
             flush=True,
         )
         print(f"Target poll rate (Hz): {config['target_poll_rate_hz']}", flush=True)
@@ -328,20 +319,15 @@ def wait_for_configuration(ser: serial.Serial):
             + ", ".join(str(channel) for channel in config["active_channels"]),
             flush=True,
         )
-        print(
-            "Logical sensor names: " + ", ".join(config["sensor_names"]),
-            flush=True,
-        )
+        print("Logical sensor names: " + ", ".join(config["sensor_names"]), flush=True)
 
         return config, bad_frames
 
 
 def expected_data_payload_size(config) -> int:
-    per_sensor = (
-        BYTES_PER_SENSOR_FULL_DIAGNOSTIC
-        if config["acquisition_mode"] == ACQ_MODE_FULL_DIAGNOSTIC
-        else BYTES_PER_SENSOR_FAST_ACCEL
-    )
+    per_sensor = BYTES_PER_SENSOR_ACCEL
+    if config["instrumentation_enabled"]:
+        per_sensor += BYTES_PER_SENSOR_INSTRUMENTATION
 
     return BASE_DATA_PAYLOAD_SIZE + config["sensor_count"] * per_sensor
 
@@ -349,7 +335,7 @@ def expected_data_payload_size(config) -> int:
 def decode_data_payload(payload: bytes, config):
     sensor_names = config["sensor_names"]
     active_channels = config["active_channels"]
-    full_diagnostic = config["acquisition_mode"] == ACQ_MODE_FULL_DIAGNOSTIC
+    instrumentation_enabled = config["instrumentation_enabled"]
 
     expected_size = expected_data_payload_size(config)
 
@@ -364,37 +350,41 @@ def decode_data_payload(payload: bytes, config):
     (
         t_us,
         sample_index,
+        cycle_duration_us,
+        lateness_us,
         missed_deadlines_total,
         i2c_error_total,
         i2c_nack_total,
         i2c_timeout_total,
-    ) = struct.unpack_from("<IIIIII", payload, offset)
-    offset += 24
+    ) = struct.unpack_from("<IIIIIIII", payload, offset)
+    offset += 32
 
     row = {
         "t_us": t_us,
         "sample_index": sample_index,
+        "cycle_duration_us": cycle_duration_us,
+        "lateness_us": lateness_us,
         "missed_deadlines_total": missed_deadlines_total,
         "i2c_error_total": i2c_error_total,
         "i2c_nack_total": i2c_nack_total,
         "i2c_timeout_total": i2c_timeout_total,
+        "target_poll_rate_hz": config["target_poll_rate_hz"],
     }
 
+    # Accelerometer values for ALL sensors are packed together first,
+    # followed by instrumentation fields for ALL sensors (if enabled) -
+    # matches the firmware's sendDataFrame() field order exactly.
+    raw_accel = []
+
     for channel, sensor_name in zip(active_channels, sensor_names):
-        if full_diagnostic:
-            raw_values = struct.unpack_from("<hhhhhh", payload, offset)
-            offset += 12
-        else:
-            raw_values = struct.unpack_from("<hhh", payload, offset)
-            offset += 6
+        ax_raw, ay_raw, az_raw = struct.unpack_from("<hhh", payload, offset)
+        offset += 6
+        raw_accel.append((sensor_name, channel, ax_raw, ay_raw, az_raw))
 
-        ax_raw, ay_raw, az_raw = raw_values[0], raw_values[1], raw_values[2]
-
+    for sensor_name, channel, ax_raw, ay_raw, az_raw in raw_accel:
         ax_g = ax_raw / ACCEL_SCALE
         ay_g = ay_raw / ACCEL_SCALE
         az_g = az_raw / ACCEL_SCALE
-
-        a_resultant_g = (ax_g**2 + ay_g**2 + az_g**2) ** 0.5
 
         row[f"{sensor_name}_pca_channel"] = channel
         row[f"{sensor_name}_ax_raw"] = ax_raw
@@ -403,58 +393,31 @@ def decode_data_payload(payload: bytes, config):
         row[f"{sensor_name}_ax_g"] = ax_g
         row[f"{sensor_name}_ay_g"] = ay_g
         row[f"{sensor_name}_az_g"] = az_g
-        row[f"{sensor_name}_a_resultant_g"] = a_resultant_g
 
-        if full_diagnostic:
-            gx_raw, gy_raw, gz_raw = raw_values[3], raw_values[4], raw_values[5]
-
-            gx_dps = gx_raw / GYRO_SCALE
-            gy_dps = gy_raw / GYRO_SCALE
-            gz_dps = gz_raw / GYRO_SCALE
-
-            row[f"{sensor_name}_gx_raw"] = gx_raw
-            row[f"{sensor_name}_gy_raw"] = gy_raw
-            row[f"{sensor_name}_gz_raw"] = gz_raw
-            row[f"{sensor_name}_gx_dps"] = gx_dps
-            row[f"{sensor_name}_gy_dps"] = gy_dps
-            row[f"{sensor_name}_gz_dps"] = gz_dps
-
-    # Preserve legacy single-sensor-style columns when s1 exists, matching
-    # the previous logger's convenience columns.
-    if "s1" in sensor_names:
-        row["ax_g"] = row["s1_ax_g"]
-        row["ay_g"] = row["s1_ay_g"]
-        row["az_g"] = row["s1_az_g"]
-        row["a_resultant_g"] = row["s1_a_resultant_g"]
-
-        if full_diagnostic:
-            row["gx_dps"] = row["s1_gx_dps"]
-            row["gy_dps"] = row["s1_gy_dps"]
-            row["gz_dps"] = row["s1_gz_dps"]
-    else:
-        row["ax_g"] = ""
-        row["ay_g"] = ""
-        row["az_g"] = ""
-        row["a_resultant_g"] = ""
-
-        if full_diagnostic:
-            row["gx_dps"] = ""
-            row["gy_dps"] = ""
-            row["gz_dps"] = ""
+    if instrumentation_enabled:
+        for sensor_name in sensor_names:
+            pca_select_us, mpu_read_us = struct.unpack_from("<HH", payload, offset)
+            offset += 4
+            row[f"{sensor_name}_pca_select_us"] = pca_select_us
+            row[f"{sensor_name}_mpu_read_us"] = mpu_read_us
+            # "Total time per sensor" is a simple derived sum, not a wire
+            # field - see main_validation.cpp header comment.
+            row[f"{sensor_name}_sensor_total_us"] = pca_select_us + mpu_read_us
 
     return row
 
 
 def build_fieldnames(config):
-    full_diagnostic = config["acquisition_mode"] == ACQ_MODE_FULL_DIAGNOSTIC
-
     fieldnames = [
         "t_us",
         "sample_index",
+        "cycle_duration_us",
+        "lateness_us",
         "missed_deadlines_total",
         "i2c_error_total",
         "i2c_nack_total",
         "i2c_timeout_total",
+        "target_poll_rate_hz",
     ]
 
     for sensor_name in config["sensor_names"]:
@@ -466,24 +429,14 @@ def build_fieldnames(config):
             f"{sensor_name}_ax_g",
             f"{sensor_name}_ay_g",
             f"{sensor_name}_az_g",
-            f"{sensor_name}_a_resultant_g",
         ]
 
-        if full_diagnostic:
+        if config["instrumentation_enabled"]:
             fieldnames += [
-                f"{sensor_name}_gx_raw",
-                f"{sensor_name}_gy_raw",
-                f"{sensor_name}_gz_raw",
-                f"{sensor_name}_gx_dps",
-                f"{sensor_name}_gy_dps",
-                f"{sensor_name}_gz_dps",
+                f"{sensor_name}_pca_select_us",
+                f"{sensor_name}_mpu_read_us",
+                f"{sensor_name}_sensor_total_us",
             ]
-
-    # Legacy convenience columns (mirror s1 when present).
-    fieldnames += ["ax_g", "ay_g", "az_g", "a_resultant_g"]
-
-    if full_diagnostic:
-        fieldnames += ["gx_dps", "gy_dps", "gz_dps"]
 
     return fieldnames
 
@@ -493,29 +446,21 @@ def build_fieldnames(config):
 # ============================================================
 
 print("\n========================================", flush=True)
-print(" ESP32 MPU6050 BINARY VIBRATION LOGGER V7", flush=True)
+print(" ESP32 ACQUISITION VALIDATION LOGGER", flush=True)
+print(" (for main_validation.cpp - accel-only, characterization only)", flush=True)
 print("========================================", flush=True)
 print(f"\nPort: {PORT}", flush=True)
 print(f"Baud: {BAUD}", flush=True)
-if args.num_sensors is None:
-    print("Sensor count: automatic", flush=True)
-else:
-    print(
-        f"Sensor count selected by app: {args.num_sensors} "
-        "(ESP32 detection will be verified)",
-        flush=True,
-    )
 print(f"Saving to:\n{output_file}", flush=True)
 print(f"Metadata sidecar:\n{metadata_file}", flush=True)
+if args.label:
+    print(f"Run label: {args.label}", flush=True)
 
 if args.prompt:
     input("\nPress ENTER to START recording...")
 
 print("\nOpening serial port...", flush=True)
-print(
-    "Stop from the PC app or press CTRL + C to stop and save the file.\n",
-    flush=True,
-)
+print("Press CTRL + C to stop and save the file.\n", flush=True)
 
 valid_frames = 0
 bad_frames = 0
@@ -530,18 +475,6 @@ try:
         config, config_bad_frames = wait_for_configuration(ser)
         bad_frames += config_bad_frames
 
-        if (
-            args.num_sensors is not None
-            and config["sensor_count"] != args.num_sensors
-        ):
-            raise RuntimeError(
-                "Sensor-count mismatch: "
-                f"the PC app selected {args.num_sensors} sensor(s), "
-                f"but the ESP32 detected {config['sensor_count']} sensor(s) "
-                f"on PCA channels {config['active_channels']}. "
-                "Check the physical connections or change the app selection."
-            )
-
         payload_size = expected_data_payload_size(config)
         fieldnames = build_fieldnames(config)
 
@@ -551,10 +484,7 @@ try:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
 
-            print(
-                "\nRecording binary data and saving decoded CSV...",
-                flush=True,
-            )
+            print("\nRecording binary data and saving decoded CSV...", flush=True)
 
             start_time = time.monotonic()
 
@@ -616,6 +546,7 @@ finally:
     print(f"\nData saved to:\n{output_file}", flush=True)
 
     metadata = {
+        "run_label": args.label,
         "run_start_wallclock": run_start_wallclock,
         "run_end_wallclock": datetime.now().isoformat(timespec="seconds"),
         "output_csv": str(output_file),
@@ -624,6 +555,11 @@ finally:
         "valid_frames": valid_frames,
         "bad_frames": bad_frames,
         "config": config,  # None if the run failed before CONFIG was received
+        "logger_notes": (
+            "Produced by logger_esp32_validation.py, matched to "
+            "main_validation.cpp only. Not compatible with the production "
+            "logger_esp32.py protocol."
+        ),
     }
 
     with open(metadata_file, "w") as mf:

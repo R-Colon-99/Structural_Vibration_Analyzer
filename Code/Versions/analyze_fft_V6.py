@@ -434,29 +434,6 @@ sampling_stats = {
     ),
 }
 
-# ============================================================
-# FIRMWARE-REPORTED ACQUISITION HEALTH (V7 protocol, if present)
-# ============================================================
-# These are cumulative counters transmitted by the firmware itself (see
-# main.cpp), distinct from the sampling-quality stats above, which are
-# derived purely from timestamps on the PC side. Older CSVs recorded
-# before this protocol version simply won't have these columns, so this
-# section is entirely optional/guarded.
-ACQUISITION_HEALTH_COLUMNS = [
-    "missed_deadlines_total",
-    "i2c_error_total",
-    "i2c_nack_total",
-    "i2c_timeout_total",
-]
-
-acquisition_health = {}
-for column in ACQUISITION_HEALTH_COLUMNS:
-    if column in df.columns:
-        # These are cumulative counters; the final row holds the run total.
-        acquisition_health[column] = int(df[column].iloc[-1])
-
-has_acquisition_health = len(acquisition_health) > 0
-
 print(f"\nData mode: {data_mode}", flush=True)
 print(f"Sensors analyzed: {', '.join(SENSOR_NAMES)}", flush=True)
 print(f"Reference sensor: {REFERENCE_SENSOR}", flush=True)
@@ -496,17 +473,6 @@ print(
     f"{'YES' if needs_resampling else 'NO'}",
     flush=True,
 )
-
-if has_acquisition_health:
-    print("\nAcquisition health (firmware-reported, cumulative):", flush=True)
-    for column, value in acquisition_health.items():
-        print(f"  {column}: {value}", flush=True)
-
-    acquisition_health_df = pd.DataFrame([acquisition_health])
-    acquisition_health_csv_path = (
-        run_folder / "acquisition_health_summary.csv"
-    )
-    acquisition_health_df.to_csv(acquisition_health_csv_path, index=False)
 
 
 # ============================================================
@@ -1480,18 +1446,6 @@ with open(summary_txt_path, "w") as f:
         f"{sampling_stats['repeated_or_reversed_indices']}\n\n"
     )
 
-    if has_acquisition_health:
-        f.write("Acquisition Health (firmware-reported, cumulative):\n")
-        f.write("---------------------------------------------------\n")
-        f.write(
-            "These counters come directly from the ESP32 firmware, not "
-            "from PC-side timestamp analysis - see main.cpp's I2C error "
-            "classification for what each one means.\n"
-        )
-        for column, value in acquisition_health.items():
-            f.write(f"  {column}: {value}\n")
-        f.write("\n")
-
     f.write("Sensor-Axis Results:\n")
     f.write("--------------------\n\n")
 
@@ -1570,8 +1524,6 @@ with open(summary_txt_path, "w") as f:
     f.write("------------\n")
     f.write("raw_data_copy.csv\n")
     f.write("sampling_quality_summary.csv\n")
-    if has_acquisition_health:
-        f.write("acquisition_health_summary.csv\n")
     f.write("sampling_jitter_dt_plot.png\n")
     f.write("time_domain_centered_all_sensor_axes.csv\n")
     f.write("time_domain_centered_all_axes.csv\n")

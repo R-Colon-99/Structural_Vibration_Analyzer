@@ -1,10 +1,8 @@
-# V7 - App-ready auto-detect binary logger matching main.cpp V7
-# (dual FAST_ACCEL / FULL_DIAGNOSTIC modes, I2C health counters)
+# V5 - App-ready auto-detect binary logger with legacy --num-sensors compatibility
 # Structural Vibration Analyzer
 
 import argparse
 import csv
-import json
 import struct
 import time
 from pathlib import Path
@@ -23,27 +21,19 @@ DEFAULT_DATA_DIR = Path(
 )
 
 ACCEL_SCALE = 4096.0  # +/-8 g
-GYRO_SCALE = 131.0    # +/-250 deg/s (FULL_DIAGNOSTIC mode only)
+GYRO_SCALE = 131.0    # +/-250 deg/s
 
 SYNC = b"\xAA\x55"
 
 PACKET_TYPE_DATA = 0x01
 PACKET_TYPE_CONFIG = 0x02
 
-ACQ_MODE_FAST_ACCEL = 0
-ACQ_MODE_FULL_DIAGNOSTIC = 1
-
-BYTES_PER_SENSOR_FAST_ACCEL = 6          # ax, ay, az (int16 each)
-BYTES_PER_SENSOR_FULL_DIAGNOSTIC = 12    # + gx, gy, gz (int16 each)
-
-# t_us, sample_index, missed_deadlines_total, i2c_error_total,
-# i2c_nack_total, i2c_timeout_total (4 bytes each)
-BASE_DATA_PAYLOAD_SIZE = 24
+BYTES_PER_SENSOR = 12
+BASE_DATA_PAYLOAD_SIZE = 8
 
 # PCA channel 0 -> s1, channel 1 -> s2, channel 2 -> s3.
 # Keeping the logical name tied to the physical PCA channel prevents
-# sensor identities from shifting when a sensor is disconnected. Not
-# tied to any fixed sensor count - however many are detected are named.
+# sensor identities from shifting when a middle sensor is disconnected.
 CHANNEL_TO_SENSOR_NAME = {
     0: "s1",
     1: "s2",
@@ -58,11 +48,8 @@ CHANNEL_TO_SENSOR_NAME = {
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "ESP32 binary logger for the Structural Vibration Analyzer "
-            "(V7 protocol: FAST_ACCEL/FULL_DIAGNOSTIC modes, I2C health "
-            "counters). Sensor count, active PCA channels, and "
-            "acquisition mode are all detected automatically from the "
-            "firmware's CONFIG frame."
+            "ESP32 binary logger for the Structural Vibration Analyzer. "
+            "Sensor count and active PCA channels are detected automatically."
         )
     )
 
@@ -133,8 +120,6 @@ if args.output:
 else:
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     output_file = DATA_DIR / f"esp32_vibration_{timestamp}.csv"
-
-metadata_file = output_file.with_suffix(".meta.json")
 
 
 # ============================================================
@@ -221,42 +206,11 @@ def read_frame(ser: serial.Serial):
 
 
 def decode_config_payload(payload: bytes):
-    """
-    CONFIG payload layout (see main.cpp V7 header comment):
-        firmware_version    [u8]
-        dlpf_cfg            [u8]
-        smplrt_div          [u8]
-        acquisition_mode    [u8]
-        target_poll_rate_hz [u32]
-        sensor_count        [u8]
-        active_channels     [u8 x sensor_count]
-    """
-    fixed_size = 1 + 1 + 1 + 1 + 4 + 1
+    if len(payload) < 1:
+        raise ValueError("Configuration packet is empty.")
 
-    if len(payload) < fixed_size:
-        raise ValueError("Configuration packet is too short.")
-
-    offset = 0
-
-    firmware_version = payload[offset]
-    offset += 1
-
-    dlpf_cfg = payload[offset]
-    offset += 1
-
-    smplrt_div = payload[offset]
-    offset += 1
-
-    acquisition_mode = payload[offset]
-    offset += 1
-
-    (target_poll_rate_hz,) = struct.unpack_from("<I", payload, offset)
-    offset += 4
-
-    sensor_count = payload[offset]
-    offset += 1
-
-    expected_size = offset + sensor_count
+    sensor_count = payload[0]
+    expected_size = 1 + sensor_count
 
     if len(payload) != expected_size:
         raise ValueError(
@@ -264,7 +218,7 @@ def decode_config_payload(payload: bytes):
             f"Expected {expected_size} bytes, received {len(payload)}."
         )
 
-    active_channels = list(payload[offset : offset + sensor_count])
+    active_channels = list(payload[1:])
 
     if sensor_count < 1:
         raise ValueError("ESP32 reported zero active sensors.")
@@ -272,28 +226,13 @@ def decode_config_payload(payload: bytes):
     if len(set(active_channels)) != len(active_channels):
         raise ValueError("Configuration packet contains duplicate PCA channels.")
 
-    sensor_names = [
-        CHANNEL_TO_SENSOR_NAME.get(channel, f"ch{channel}")
-        for channel in active_channels
-    ]
+    sensor_names = []
 
-    config = {
-        "firmware_version": firmware_version,
-        "dlpf_cfg": dlpf_cfg,
-        "smplrt_div": smplrt_div,
-        "acquisition_mode": acquisition_mode,
-        "acquisition_mode_name": (
-            "FULL_DIAGNOSTIC"
-            if acquisition_mode == ACQ_MODE_FULL_DIAGNOSTIC
-            else "FAST_ACCEL"
-        ),
-        "target_poll_rate_hz": target_poll_rate_hz,
-        "sensor_count": sensor_count,
-        "active_channels": active_channels,
-        "sensor_names": sensor_names,
-    }
+    for channel in active_channels:
+        sensor_name = CHANNEL_TO_SENSOR_NAME.get(channel, f"ch{channel}")
+        sensor_names.append(sensor_name)
 
-    return config
+    return sensor_count, active_channels, sensor_names
 
 
 def wait_for_configuration(ser: serial.Serial):
@@ -313,177 +252,112 @@ def wait_for_configuration(ser: serial.Serial):
         if packet_type != PACKET_TYPE_CONFIG:
             continue
 
-        config = decode_config_payload(payload)
+        sensor_count, active_channels, sensor_names = decode_config_payload(payload)
 
-        print(f"Firmware version: {config['firmware_version']}", flush=True)
-        print(
-            f"DLPF_CFG={config['dlpf_cfg']}  SMPLRT_DIV={config['smplrt_div']}  "
-            f"acquisition_mode={config['acquisition_mode_name']}",
-            flush=True,
-        )
-        print(f"Target poll rate (Hz): {config['target_poll_rate_hz']}", flush=True)
-        print(f"Detected sensors: {config['sensor_count']}", flush=True)
+        print(f"Detected sensors: {sensor_count}", flush=True)
         print(
             "Active PCA channels: "
-            + ", ".join(str(channel) for channel in config["active_channels"]),
+            + ", ".join(str(channel) for channel in active_channels),
             flush=True,
         )
         print(
-            "Logical sensor names: " + ", ".join(config["sensor_names"]),
+            "Logical sensor names: " + ", ".join(sensor_names),
             flush=True,
         )
 
-        return config, bad_frames
+        return sensor_count, active_channels, sensor_names, bad_frames
 
 
-def expected_data_payload_size(config) -> int:
-    per_sensor = (
-        BYTES_PER_SENSOR_FULL_DIAGNOSTIC
-        if config["acquisition_mode"] == ACQ_MODE_FULL_DIAGNOSTIC
-        else BYTES_PER_SENSOR_FAST_ACCEL
+def decode_data_payload(payload: bytes, active_channels, sensor_names):
+    expected_payload_size = (
+        BASE_DATA_PAYLOAD_SIZE + len(sensor_names) * BYTES_PER_SENSOR
     )
 
-    return BASE_DATA_PAYLOAD_SIZE + config["sensor_count"] * per_sensor
-
-
-def decode_data_payload(payload: bytes, config):
-    sensor_names = config["sensor_names"]
-    active_channels = config["active_channels"]
-    full_diagnostic = config["acquisition_mode"] == ACQ_MODE_FULL_DIAGNOSTIC
-
-    expected_size = expected_data_payload_size(config)
-
-    if len(payload) != expected_size:
+    if len(payload) != expected_payload_size:
         raise ValueError(
             "Unexpected data payload size. "
-            f"Expected {expected_size}, received {len(payload)}."
+            f"Expected {expected_payload_size}, received {len(payload)}."
         )
 
     offset = 0
 
-    (
-        t_us,
-        sample_index,
-        missed_deadlines_total,
-        i2c_error_total,
-        i2c_nack_total,
-        i2c_timeout_total,
-    ) = struct.unpack_from("<IIIIII", payload, offset)
-    offset += 24
+    t_us, sample_index = struct.unpack_from("<II", payload, offset)
+    offset += 8
 
     row = {
         "t_us": t_us,
         "sample_index": sample_index,
-        "missed_deadlines_total": missed_deadlines_total,
-        "i2c_error_total": i2c_error_total,
-        "i2c_nack_total": i2c_nack_total,
-        "i2c_timeout_total": i2c_timeout_total,
     }
 
     for channel, sensor_name in zip(active_channels, sensor_names):
-        if full_diagnostic:
-            raw_values = struct.unpack_from("<hhhhhh", payload, offset)
-            offset += 12
-        else:
-            raw_values = struct.unpack_from("<hhh", payload, offset)
-            offset += 6
+        raw_values = struct.unpack_from("<hhhhhh", payload, offset)
+        offset += 12
 
-        ax_raw, ay_raw, az_raw = raw_values[0], raw_values[1], raw_values[2]
+        ax_g = raw_values[0] / ACCEL_SCALE
+        ay_g = raw_values[1] / ACCEL_SCALE
+        az_g = raw_values[2] / ACCEL_SCALE
 
-        ax_g = ax_raw / ACCEL_SCALE
-        ay_g = ay_raw / ACCEL_SCALE
-        az_g = az_raw / ACCEL_SCALE
+        gx_dps = raw_values[3] / GYRO_SCALE
+        gy_dps = raw_values[4] / GYRO_SCALE
+        gz_dps = raw_values[5] / GYRO_SCALE
 
         a_resultant_g = (ax_g**2 + ay_g**2 + az_g**2) ** 0.5
 
         row[f"{sensor_name}_pca_channel"] = channel
-        row[f"{sensor_name}_ax_raw"] = ax_raw
-        row[f"{sensor_name}_ay_raw"] = ay_raw
-        row[f"{sensor_name}_az_raw"] = az_raw
         row[f"{sensor_name}_ax_g"] = ax_g
         row[f"{sensor_name}_ay_g"] = ay_g
         row[f"{sensor_name}_az_g"] = az_g
+        row[f"{sensor_name}_gx_dps"] = gx_dps
+        row[f"{sensor_name}_gy_dps"] = gy_dps
+        row[f"{sensor_name}_gz_dps"] = gz_dps
         row[f"{sensor_name}_a_resultant_g"] = a_resultant_g
 
-        if full_diagnostic:
-            gx_raw, gy_raw, gz_raw = raw_values[3], raw_values[4], raw_values[5]
-
-            gx_dps = gx_raw / GYRO_SCALE
-            gy_dps = gy_raw / GYRO_SCALE
-            gz_dps = gz_raw / GYRO_SCALE
-
-            row[f"{sensor_name}_gx_raw"] = gx_raw
-            row[f"{sensor_name}_gy_raw"] = gy_raw
-            row[f"{sensor_name}_gz_raw"] = gz_raw
-            row[f"{sensor_name}_gx_dps"] = gx_dps
-            row[f"{sensor_name}_gy_dps"] = gy_dps
-            row[f"{sensor_name}_gz_dps"] = gz_dps
-
-    # Preserve legacy single-sensor-style columns when s1 exists, matching
-    # the previous logger's convenience columns.
+    # Preserve legacy single-sensor-style columns when s1 exists.
     if "s1" in sensor_names:
         row["ax_g"] = row["s1_ax_g"]
         row["ay_g"] = row["s1_ay_g"]
         row["az_g"] = row["s1_az_g"]
+        row["gx_dps"] = row["s1_gx_dps"]
+        row["gy_dps"] = row["s1_gy_dps"]
+        row["gz_dps"] = row["s1_gz_dps"]
         row["a_resultant_g"] = row["s1_a_resultant_g"]
-
-        if full_diagnostic:
-            row["gx_dps"] = row["s1_gx_dps"]
-            row["gy_dps"] = row["s1_gy_dps"]
-            row["gz_dps"] = row["s1_gz_dps"]
     else:
         row["ax_g"] = ""
         row["ay_g"] = ""
         row["az_g"] = ""
+        row["gx_dps"] = ""
+        row["gy_dps"] = ""
+        row["gz_dps"] = ""
         row["a_resultant_g"] = ""
-
-        if full_diagnostic:
-            row["gx_dps"] = ""
-            row["gy_dps"] = ""
-            row["gz_dps"] = ""
 
     return row
 
 
-def build_fieldnames(config):
-    full_diagnostic = config["acquisition_mode"] == ACQ_MODE_FULL_DIAGNOSTIC
+def build_fieldnames(sensor_names):
+    fieldnames = ["t_us", "sample_index"]
 
-    fieldnames = [
-        "t_us",
-        "sample_index",
-        "missed_deadlines_total",
-        "i2c_error_total",
-        "i2c_nack_total",
-        "i2c_timeout_total",
-    ]
-
-    for sensor_name in config["sensor_names"]:
+    for sensor_name in sensor_names:
         fieldnames += [
             f"{sensor_name}_pca_channel",
-            f"{sensor_name}_ax_raw",
-            f"{sensor_name}_ay_raw",
-            f"{sensor_name}_az_raw",
             f"{sensor_name}_ax_g",
             f"{sensor_name}_ay_g",
             f"{sensor_name}_az_g",
+            f"{sensor_name}_gx_dps",
+            f"{sensor_name}_gy_dps",
+            f"{sensor_name}_gz_dps",
             f"{sensor_name}_a_resultant_g",
         ]
 
-        if full_diagnostic:
-            fieldnames += [
-                f"{sensor_name}_gx_raw",
-                f"{sensor_name}_gy_raw",
-                f"{sensor_name}_gz_raw",
-                f"{sensor_name}_gx_dps",
-                f"{sensor_name}_gy_dps",
-                f"{sensor_name}_gz_dps",
-            ]
-
-    # Legacy convenience columns (mirror s1 when present).
-    fieldnames += ["ax_g", "ay_g", "az_g", "a_resultant_g"]
-
-    if full_diagnostic:
-        fieldnames += ["gx_dps", "gy_dps", "gz_dps"]
+    # Legacy convenience columns.
+    fieldnames += [
+        "ax_g",
+        "ay_g",
+        "az_g",
+        "gx_dps",
+        "gy_dps",
+        "gz_dps",
+        "a_resultant_g",
+    ]
 
     return fieldnames
 
@@ -493,7 +367,7 @@ def build_fieldnames(config):
 # ============================================================
 
 print("\n========================================", flush=True)
-print(" ESP32 MPU6050 BINARY VIBRATION LOGGER V7", flush=True)
+print(" ESP32 MPU6050 BINARY VIBRATION LOGGER V4", flush=True)
 print("========================================", flush=True)
 print(f"\nPort: {PORT}", flush=True)
 print(f"Baud: {BAUD}", flush=True)
@@ -506,7 +380,6 @@ else:
         flush=True,
     )
 print(f"Saving to:\n{output_file}", flush=True)
-print(f"Metadata sidecar:\n{metadata_file}", flush=True)
 
 if args.prompt:
     input("\nPress ENTER to START recording...")
@@ -520,32 +393,42 @@ print(
 valid_frames = 0
 bad_frames = 0
 start_time = None
-run_start_wallclock = datetime.now().isoformat(timespec="seconds")
-config = None
 
 try:
     with serial.Serial(PORT, BAUD, timeout=2) as ser:
         read_until_binary_start(ser)
 
-        config, config_bad_frames = wait_for_configuration(ser)
+        (
+            sensor_count,
+            active_channels,
+            sensor_names,
+            config_bad_frames,
+        ) = wait_for_configuration(ser)
+
         bad_frames += config_bad_frames
 
         if (
             args.num_sensors is not None
-            and config["sensor_count"] != args.num_sensors
+            and sensor_count != args.num_sensors
         ):
             raise RuntimeError(
                 "Sensor-count mismatch: "
                 f"the PC app selected {args.num_sensors} sensor(s), "
-                f"but the ESP32 detected {config['sensor_count']} sensor(s) "
-                f"on PCA channels {config['active_channels']}. "
+                f"but the ESP32 detected {sensor_count} sensor(s) "
+                f"on PCA channels {active_channels}. "
                 "Check the physical connections or change the app selection."
             )
 
-        payload_size = expected_data_payload_size(config)
-        fieldnames = build_fieldnames(config)
+        expected_data_payload_size = (
+            BASE_DATA_PAYLOAD_SIZE + sensor_count * BYTES_PER_SENSOR
+        )
 
-        print(f"Expected data payload size: {payload_size} bytes", flush=True)
+        fieldnames = build_fieldnames(sensor_names)
+
+        print(
+            f"Expected data payload size: {expected_data_payload_size} bytes",
+            flush=True,
+        )
 
         with open(output_file, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -582,12 +465,16 @@ try:
                     bad_frames += 1
                     continue
 
-                if len(payload) != payload_size:
+                if len(payload) != expected_data_payload_size:
                     bad_frames += 1
                     continue
 
                 try:
-                    row = decode_data_payload(payload, config)
+                    row = decode_data_payload(
+                        payload,
+                        active_channels,
+                        sensor_names,
+                    )
                 except ValueError:
                     bad_frames += 1
                     continue
@@ -599,8 +486,6 @@ try:
                     print(
                         f"Samples: {valid_frames} | "
                         f"t = {row['t_us'] / 1_000_000.0:.3f} s | "
-                        f"missed deadlines: {row['missed_deadlines_total']} | "
-                        f"I2C errors: {row['i2c_error_total']} | "
                         f"bad frames: {bad_frames}",
                         end="\r",
                         flush=True,
@@ -614,20 +499,4 @@ finally:
     print(f"Valid samples saved: {valid_frames}", flush=True)
     print(f"Bad/corrupted frames skipped: {bad_frames}", flush=True)
     print(f"\nData saved to:\n{output_file}", flush=True)
-
-    metadata = {
-        "run_start_wallclock": run_start_wallclock,
-        "run_end_wallclock": datetime.now().isoformat(timespec="seconds"),
-        "output_csv": str(output_file),
-        "port": PORT,
-        "baud": BAUD,
-        "valid_frames": valid_frames,
-        "bad_frames": bad_frames,
-        "config": config,  # None if the run failed before CONFIG was received
-    }
-
-    with open(metadata_file, "w") as mf:
-        json.dump(metadata, mf, indent=2)
-
-    print(f"Metadata saved to:\n{metadata_file}", flush=True)
     print("\nDone.", flush=True)
