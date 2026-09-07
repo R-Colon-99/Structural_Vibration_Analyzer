@@ -19,6 +19,8 @@ conda activate Mech-Engi-env
 cd /d F:\RLenovo99\Documents\Projects\Structural_Vibration_Analyzer\Code\python_tools
 python logger_esp32.py
 python analyze_fft.py
+python logger_esp32_validation.py
+python analyze_validation.py
 
 PC_App:
 
